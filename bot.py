@@ -56,9 +56,19 @@ JUMP_P_IDLE = 0.04
 LEAD_TAU = 2.0
 GUN_MAX_MECH = 160.0
 HOSTILE_ONLY = True
+PEEK = True
+BUDGET_PEEK = 0.010
+BUDGET_SPOT = 0.014
+BUDGET_TOTAL = 0.022
+PEEK_MAX_D = 230.0
+PEEK_GUN_S = 0.35
+PEEK_MAX_DMG = 120.0
+PEEK_REST = 0.15
+PEEK_STEP = 6.0
+PEEK_BOOST = True
 STICKY = 250.0
 FOCUS_W = 400.0
-PURSUE = True
+PURSUE = False
 STRAFE_ANG = 0.6
 STOP_P = 0.15
 STRAFE_BOOST = True
@@ -136,7 +146,16 @@ class Bot:
         self.last_move = None
         self._zone_now = None
         self._cached_threats = []
+        self.t_start = time.perf_counter()
         self.hostile = {}         # mech id -> last time it acted hostile toward us
+        self.peek_state = "hide"
+        self.peek_pair = None
+        self.peek_plan_t = -99.0
+        self.peek_start = -99.0
+        self.peek_next_t = 0.0
+        self.peek_arrive_t = None
+        self.peek_laser = False
+        self.preaim = None
         self.aim_seen = {}        # mech id -> consecutive decisions with its torso deliberately on us
         self.strafe_side = 1.0
         self.strafe_flip_t = 0.0
@@ -186,8 +205,12 @@ class Bot:
         zn["next_radius"] = fin(zn.get("next_radius"), zn["radius"])
         obs["t"] = fin(obs.get("t"), 0.0)
 
+    def _elapsed(self):
+        return time.perf_counter() - self.t_start
+
     def act(self, obs):
         t0 = time.perf_counter()
+        self.t_start = t0
         try:
             self._sanitize(obs)
         except Exception:
@@ -550,7 +573,7 @@ class Bot:
         when we reverse; hops shift the vertical aim point."""
         t, x, y = self.t, self.x, self.y
         s = self.s
-        if t < self.unstick_until or not STRAFE:
+        if t < self.unstick_until or not STRAFE or self.goal_kind in ("peek", "cover"):
             return move, boost, jump
         grounded = bool(s.get("grounded", True))
         kind = self.goal_kind
@@ -716,9 +739,25 @@ class Bot:
             goal = self._safe_point(ncx, ncy, safe_r)
             boost = energy > 15 and (slack < 3 or not s.get("in_zone", True))
         elif live or engaged:
-            kind = "fight" if fight_target is not None else "evade"
-            goal = self._best_spot(obs, threats, impacts, ncx, ncy, safe_r, cx, cy, r, heavy_ok, fight_target)
-            boost = engaged and energy > 35 and fight_target is None
+            pk = None
+            if PEEK and M is not None:
+                try:
+                    pk = self._peek(obs, live, heavy_ok, cx, cy, r)
+                except Exception:
+                    self._err("peek")
+                    pk = None
+            if pk is not None:
+                kind, goal = pk
+                self.fight_target = fight_target = None
+                # strafe-peek: cross between cover and the peek spot at full speed
+                if (PEEK_BOOST or kind == "tocover") and goal is not None and math.hypot(goal[0] - x, goal[1] - y) > 1.5:
+                    if energy > 25 and s.get("grounded", True):
+                        boost = True
+            else:
+                self.peek_state = "hide"
+                kind = "fight" if fight_target is not None else "evade"
+                goal = self._best_spot(obs, threats, impacts, ncx, ncy, safe_r, cx, cy, r, heavy_ok, fight_target)
+                boost = engaged and energy > 35 and fight_target is None
         else:
             loot = None
             if hp_frac > 0.35 or t - self.last_dmg_t > 8:
@@ -770,6 +809,138 @@ class Bot:
             if best is not None:
                 return best
         return None
+
+    # ---- corner peeking ---------------------------------------------------------------
+    def _peek(self, obs, live, heavy_ok, cx, cy, r):
+        """Hold a spot the attacker can't see (H); step to an adjacent spot that sees it (P) only to
+        fire a burst / a charged laser, then step back. Returns (kind, goal) or None to fall back."""
+        t, x, y = self.t, self.x, self.y
+        hostile = [m for m, w in live if self._is_hostile(m)]
+        T = None
+        if hostile:
+            T = min(hostile, key=lambda m: math.hypot(m["pos"][0] - x, m["pos"][1] - y))
+        elif t - self.last_dmg_t < 3:
+            for k, v in self.attackers.items():
+                if t - v < 3 and k in self.memory:
+                    T = self.memory[k]
+                    break
+        if T is None:
+            return None
+        tx, ty, tz = T["pos"]
+        if math.hypot(tx - x, ty - y) > PEEK_MAX_D:
+            return None
+        others = [m for m, w in live if m is not T and math.hypot(m["pos"][0] - x, m["pos"][1] - y) < 220][:3]
+        pair = self.peek_pair
+        if (pair is None or t - self.peek_plan_t > 0.4 or pair[2] != T.get("id")
+                or math.hypot(pair[3][0] - tx, pair[3][1] - ty) > 6):
+            pair = self._peek_pair(T, others, heavy_ok, cx, cy, r)
+            self.peek_plan_t = t
+            self.peek_pair = pair
+        if pair is None:
+            return None
+        H, P = pair[0], pair[1]
+        # pre-aim at the target so the torso is already on it when we step out
+        self.preaim = (math.atan2(ty - y, tx - x), math.atan2(tz + 4.5 - (self.z + 7.0), max(1.0, math.hypot(tx - x, ty - y))), t)
+        if math.hypot(H[0] - x, H[1] - y) > 12:
+            self.peek_state = "hide"
+            return ("tocover", H)
+        if P is None:
+            self.peek_state = "hide"
+            return ("cover", H)
+        gun = self._gun()
+        w1 = self._w1()
+        laser = w1 is not None and w1.get("kind") == "laser"
+        lfull = laser and fin(w1.get("charge", 0)) >= w1.get("stats", {}).get("charge", 0.75) - 0.06
+        lbusy = laser and fin(w1.get("cooldown", 0)) <= 0 and not lfull  # charging up behind cover
+        gun_ready = gun is not None and gun.get("reload", 0) <= 0 and gun.get("ammo", 0) >= 3
+        took = sum(a for (tt, a) in self.dmg_window if tt >= self.peek_start)
+        if self.peek_state == "hide":
+            ready = lfull or (gun_ready and not lbusy)
+            if ready and t >= self.peek_next_t:
+                self.peek_state = "peek"
+                self.peek_start = t
+                self.peek_arrive_t = None
+                self.peek_laser = lfull
+        if self.peek_state == "peek":
+            arrived = math.hypot(P[0] - x, P[1] - y) < 1.6
+            if arrived and self.peek_arrive_t is None:
+                self.peek_arrive_t = t
+            done = False
+            if self.peek_laser and laser and fin(w1.get("charge", 0)) <= 0:
+                done = True  # beam released
+            elif not self.peek_laser and self.peek_arrive_t is not None and t - self.peek_arrive_t > PEEK_GUN_S:
+                done = True
+            if took >= PEEK_MAX_DMG or t - self.peek_start > 2.5 or (gun is not None and gun.get("ammo", 0) <= 0 and not self.peek_laser):
+                done = True
+            if done:
+                self.peek_state = "hide"
+                self.peek_next_t = t + PEEK_REST
+            else:
+                return ("peek", P)
+        return ("cover", H)
+
+    def _peek_pair(self, T, others, heavy_ok, cx, cy, r):
+        M = self.map
+        x, y = self.x, self.y
+        tx, ty, tz = T["pos"]
+        scale = 1 + 0.05 * (T.get("cubes") or 0)
+        t_eye, t_cen, t_muz = tz + 8.0 * scale, tz + 4.5 * scale, tz + 7.0 * scale
+        rings = (3.0, 5.5, 8.0, 11.0) if heavy_ok else (4.0, 8.0)
+        nd = 12 if heavy_ok else 8
+        cands = [(x, y)]
+        for rad in rings:
+            for i in range(nd):
+                a = TAU * i / nd
+                cands.append((x + rad * math.cos(a), y + rad * math.sin(a)))
+        Hs, Ps = [], []
+        far = []
+        for rad in (16.0, 24.0, 34.0):
+            for i in range(12):
+                a = TAU * (i + 0.5) / 12
+                far.append((x + rad * math.cos(a), y + rad * math.sin(a)))
+        n_near = len(cands)
+        cands = cands + far
+        for i, (px, py) in enumerate(cands):
+            if i == n_near and Hs:
+                break  # cover close by: no need to look farther
+            if i > 0 and self._elapsed() > BUDGET_PEEK:
+                break  # out of time this decision: use what we have
+            if i > 0 and (not M.walkable(px, py) or not M.walk_line(x, y, px, py)):
+                continue
+            if math.hypot(px - cx, py - cy) > r - 4:
+                continue
+            gz = M.ground(px, py)
+            exp_o = 0
+            for o in others:
+                ox, oy, oz = o["pos"]
+                if M.los(ox, oy, oz + 8, px, py, gz + 4.5) or M.los(ox, oy, oz + 8, px, py, gz + 8.5):
+                    exp_o += 1
+            seen = M.los(tx, ty, t_eye, px, py, gz + 4.5) or M.los(tx, ty, t_eye, px, py, gz + 8.5)
+            d_us = math.hypot(px - x, py - y)
+            if not seen:
+                Hs.append((d_us + 25 * exp_o - 1.0 * min(M.cover_at(px, py), 8), (px, py)))
+            elif i < n_near and M.los(px, py, gz + 7.0, tx, ty, t_cen):
+                hull = not M.los(tx, ty, t_muz, px, py, gz + 4.5)  # their shot at our center hits the wall
+                Ps.append(((px, py), exp_o, hull))
+        # keep the previous hiding spot while it is still hidden (no drifting between equal spots)
+        prev = self.peek_pair[0] if self.peek_pair is not None else None
+        if prev is not None and math.hypot(prev[0] - x, prev[1] - y) < 14:
+            gz = M.ground(prev[0], prev[1])
+            if not (M.los(tx, ty, t_eye, prev[0], prev[1], gz + 4.5) or M.los(tx, ty, t_eye, prev[0], prev[1], gz + 8.5)):
+                Hs.append((-1e6, prev))
+        if not Hs:
+            return None
+        Hs.sort(key=lambda a: a[0])
+        H = Hs[0][1]
+        best, bc = None, 1e9
+        for (pp, exp_o, hull) in Ps:
+            dh = math.hypot(pp[0] - H[0], pp[1] - H[1])
+            if dh > PEEK_STEP:
+                continue
+            c = dh + 25 * exp_o - (12 if hull else 0)
+            if c < bc:
+                bc, best = c, pp
+        return (H, best, T.get("id"), (tx, ty))
 
     def _is_hostile(self, m):
         if not HOSTILE_ONLY:
@@ -941,6 +1112,8 @@ class Bot:
 
         best, bs = None, -1e18
         for i, (px, py) in enumerate(cands):
+            if i > 2 and self._elapsed() > BUDGET_SPOT:
+                break
             if M is not None:
                 if not M.walkable(px, py):
                     continue
@@ -1021,7 +1194,7 @@ class Bot:
                 gk = M.nearest_walkable(gx, gy, 10)
                 self.astar = nav.AStar(M, sk, gk, self._zone_now)
                 self.astar_goal = (gx, gy)
-            if self.astar.step(4000, 0.008 if heavy_ok else 0.003):
+            if self.astar.step(4000, max(0.001, min(0.008 if heavy_ok else 0.003, BUDGET_TOTAL - self._elapsed()))):
                 if not self.astar.path and M.reset_marks():
                     # our learned blocks cut every route: forget them and search again next tick
                     self.astar = None
@@ -1126,6 +1299,9 @@ class Bot:
             aim = self._idle_aim(obs)
             # a laser still charging with nobody to shoot: release it after a while
             if wk == "laser" and fin(w1.get("charge", 0)) > 0 and t - self.target_seen_t < 1.2:
+                fire1 = True
+            # behind cover with an attacker around: charge up now, release when we peek
+            if wk == "laser" and self.goal_kind in ("cover", "peek") and fin(w1.get("cooldown", 0)) <= 0:
                 fire1 = True
         else:
             m, cz, d, cat = best
@@ -1259,6 +1435,8 @@ class Bot:
 
     def _idle_aim(self, obs):
         t, x, y = self.t, self.x, self.y
+        if self.preaim is not None and t - self.preaim[2] < 0.5:
+            return (self.preaim[0], self.preaim[1])
         if t - self.last_dmg_t < 3 and self.last_dmg_bearing is not None:
             self.scan_yaw = self.last_dmg_bearing
             return (self.last_dmg_bearing, 0.0)
