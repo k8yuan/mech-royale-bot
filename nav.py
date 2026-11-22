@@ -262,8 +262,19 @@ class Map:
     def mark_blocked(self, x: float, y: float) -> None:
         """Learned at runtime: a gap we could not get through. A* avoids it from now on."""
         k = self.nidx(x, y)
-        if k >= 0:
+        if k >= 0 and self.walk[k]:
+            if getattr(self, "walk0", None) is None:
+                self.walk0 = bytes(self.walk)
             self.walk[k] = 0
+            self.marks = getattr(self, "marks", 0) + 1
+
+    def reset_marks(self) -> bool:
+        """Forget learned blocks (e.g. when they cut off every route). True if anything changed."""
+        if getattr(self, "marks", 0) and getattr(self, "walk0", None) is not None and len(self.walk0) == len(self.walk):
+            self.walk[:] = self.walk0
+            self.marks = 0
+            return True
+        return False
 
     def walkable(self, x: float, y: float) -> bool:
         k = self.nidx(x, y)

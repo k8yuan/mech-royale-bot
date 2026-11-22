@@ -19,6 +19,7 @@ import time
 
 sys.path.insert(0, ".")
 sys.path.insert(0, "tools/archive")
+sys.path.insert(0, "tools")
 import nav  # noqa: E402
 
 KIT = "kit/mechfight-kit"
@@ -36,11 +37,16 @@ def load_hello():
     return h
 
 
+PHYS = "--nophys" not in sys.argv
 UPG = ["plating", "armor", "servos", "nanites", "sensors", "gyros", "capacitor", "reactor", "gun_damage", "gun_rate"]
 
 
 class Sim:
-    def __init__(self, M, hello, bot_cls, seed, hunt="normal"):
+    def __init__(self, M, hello, bot_cls, seed, hunt="normal", intel="omni", tough=False):
+        self.intel, self.tough = intel, tough
+        self.phys = PHYS
+        self.last_seen_pos = None
+        self.last_seen_t = -99.0
         self.M, self.hello, self.cfg = M, hello, hello["config"]
         self.rng = random.Random(seed)
         self.t = 0.0
@@ -56,7 +62,7 @@ class Sim:
         spots = self._spawns(16, 130)
         for i in range(16):
             tier = None if i == 0 else tiers[i - 1]
-            acc = {"easy": 0.25, "medium": 0.4, "hard": 0.55, "expert": 0.7}.get(tier, 0)
+            acc = {"easy": 0.25, "medium": 0.4, "hard": 0.55, "expert": 0.7}.get(tier, 0) + (0.15 if tough else 0.0)
             # everyone spawns with the gun; squad members find a laser some time later (tier-dependent)
             laser = False
             laser_t = 1e9
@@ -83,6 +89,7 @@ class Sim:
         self.next_cube = 5000
         self.drops = []
         self.shells = []
+        self.bullets = []
         h = dict(hello)
         h["slot"] = 0
         self.bot = bot_cls(h)
@@ -228,6 +235,7 @@ class Sim:
     def move(self, m, dt, speed=11.7):
         M = self.M
         cmd = m["cmd"]
+        air = m.get("zoff", 0.0) > 0.01 or m.get("vz", 0.0) > 0
         sm = m.get("speed_mult", 1.0)
         sp = (19.5 if (m["boost"] and m["energy"] > 1) else speed) * sm
         if m.get("charge", 0) > 0 and m is self.me:
@@ -240,12 +248,20 @@ class Sim:
         vx, vy = m["vel"][0], m["vel"][1]
         dvx, dvy = tvx - vx, tvy - vy
         dv = math.hypot(dvx, dvy)
-        mx = 58.5 * dt
+        mx = (12.0 if air else 58.5) * dt
         if dv > mx:
             dvx, dvy = dvx / dv * mx, dvy / dv * mx
         vx, vy = vx + dvx, vy + dvy
         x, y = m["pos"][0], m["pos"][1]
         nx, ny = x + vx * dt, y + vy * dt
+        climbing = m is self.me and m.get("jump_cmd") and m["boost"] and m["energy"] > 1
+        if climbing and not self._free(nx, ny):
+            k = M.fidx(nx, ny)
+            if k >= 0 and M.ftop[k] - M.fground[k] < 25:
+                m["energy"] -= 15 * dt
+                m["pos"] = [nx, ny, M.ground(nx, ny)]
+                m["vel"] = [vx, vy, 0.0]
+                return
         if not self._free(x, y):
             x, y = nx, ny
         elif self._free(nx, ny):
@@ -256,8 +272,19 @@ class Sim:
             y, vx = ny, 0.0
         else:
             vx, vy = 0.0, 0.0
-        m["pos"] = [x, y, M.ground(x, y)]
-        m["vel"] = [vx, vy, 0.0]
+        vz = m.get("vz", 0.0)
+        zoff = m.get("zoff", 0.0)
+        if m.get("jump_cmd") and zoff <= 0.01 and vz <= 0:
+            vz = 11.0
+            m["jump_cmd"] = False
+        if zoff > 0.0 or vz > 0:
+            zoff += vz * dt
+            vz -= 22.0 * dt
+            if zoff <= 0:
+                zoff, vz = 0.0, 0.0
+        m["vz"], m["zoff"] = vz, zoff
+        m["pos"] = [x, y, M.ground(x, y) + zoff]
+        m["vel"] = [vx, vy, vz]
 
     def _free(self, x, y):
         M = self.M
@@ -278,15 +305,42 @@ class Sim:
         if cansee:
             for o in self.mechs[1:]:
                 o["seen_us"] = self.t
-        known = self.t - m["seen_us"] < 5 or m["hunter"]
+            self.last_seen_pos, self.last_seen_t = (me["pos"][0], me["pos"][1]), self.t
+        known = self.t - m["seen_us"] < 5 or (m["hunter"] and self.intel == "omni")
+        if self.tough:
+            # squad members farm too: slowly gain cubes
+            want = min(8, int(self.t / 35) + (m["id"] % 3))
+            if m["cubes"] < want:
+                m["cubes"] += 1
+                new = 1400 * (1 + 0.04 * m["cubes"])
+                m["hp"] += new - m["max_hp"]
+                m["max_hp"] = new
+            if m["hp"] < 0.35 * m["max_hp"]:
+                m["retreat"] = True
+            elif m["hp"] > 0.85 * m["max_hp"]:
+                m["retreat"] = False
         ncx, ncy = z["next_center"]
         dz = math.hypot(m["pos"][0] - ncx, m["pos"][1] - ncy)
         goal = None
-        if dz > z["next_radius"] * 0.8 + 5 and (not m["hunter"] or dz > z["next_radius"]):
+        # where hunters think we are
+        if self.intel == "omni":
+            target_pos = (me["pos"][0], me["pos"][1])
+        elif self.last_seen_pos is not None and self.t - self.last_seen_t < 30:
+            target_pos = self.last_seen_pos
+        else:
+            target_pos = None
+        if m.get("retreat") and me["alive"] and d < 220:
+            a = math.atan2(m["pos"][1] - me["pos"][1], m["pos"][0] - me["pos"][0])
+            goal = (m["pos"][0] + 40 * math.cos(a), m["pos"][1] + 40 * math.sin(a))
+        elif dz > z["next_radius"] * 0.8 + 5 and (not m["hunter"] or dz > z["next_radius"]):
             goal = (ncx, ncy)
-        elif m["hunter"] and me["alive"]:
-            if d > 70 or not cansee:
-                goal = (me["pos"][0], me["pos"][1])
+        elif m["hunter"] and me["alive"] and target_pos is not None and not (cansee and d <= 70):
+            goal = target_pos
+            if not cansee and math.hypot(target_pos[0] - m["pos"][0], target_pos[1] - m["pos"][1]) < 8:
+                self.last_seen_pos = None  # searched there, nothing
+        elif m["hunter"] and me["alive"] and cansee:
+            if False:
+                pass
             else:
                 a = math.atan2(m["pos"][1] - me["pos"][1], m["pos"][0] - me["pos"][0]) + 0.6
                 goal = (me["pos"][0] + 70 * math.cos(a), me["pos"][1] + 70 * math.sin(a))
@@ -318,8 +372,21 @@ class Sim:
             m["cmd"] = [0, 0]
         m["boost"] = False
         if known and me["alive"] and (cansee or (d < 200 and self.los(m, me))):
-            m["aim_cmd"] = [math.atan2(me["pos"][1] - m["pos"][1], me["pos"][0] - m["pos"][0]), 0]
-            m["fire"] = cansee and (m["hunter"] or d < 110)
+            ft = d / 252.0
+            lead = 0.0 if (m["laser"] and m["lcd"] <= 0) else ft
+            px, py = me["pos"][0] + me["vel"][0] * lead, me["pos"][1] + me["vel"][1] * lead
+            err = math.radians({"easy": 1.6, "medium": 1.1, "hard": 0.7, "expert": 0.45}[m["tier"]])
+            m["aim_cmd"] = [math.atan2(py - m["pos"][1], px - m["pos"][0]) + self.rng.gauss(0, err),
+                            math.atan2(me["pos"][2] + 4.5 - m["pos"][2] - 7, max(1.0, d))]
+            m["fire"] = cansee and (m["hunter"] or d < 110) and not m.get("retreat")
+            if self.tough and m["fire"]:
+                if self.t > m.get("strafe_t", 0):
+                    m["strafe"] = self.rng.choice((-1.0, 1.0))
+                    m["strafe_t"] = self.t + self.rng.uniform(0.4, 1.0)
+                a = math.atan2(me["pos"][1] - m["pos"][1], me["pos"][0] - m["pos"][0]) + PI / 2
+                cx, cy = m["cmd"][0] * 0.5 + m["strafe"] * math.cos(a), m["cmd"][1] * 0.5 + m["strafe"] * math.sin(a)
+                n = math.hypot(cx, cy) or 1.0
+                m["cmd"] = [cx / n, cy / n]
         else:
             m["aim_cmd"] = [math.atan2(m["cmd"][1], m["cmd"][0]) if (m["cmd"][0] or m["cmd"][1]) else m["aim"][0], 0]
             m["fire"] = False
@@ -336,6 +403,24 @@ class Sim:
             m["charge"] = 0.0
             return
         d = math.hypot(me["pos"][0] - m["pos"][0], me["pos"][1] - m["pos"][1])
+        if self.phys:
+            if m["aim_cmd"] is None or abs(wrap(m["aim_cmd"][0] - m["aim"][0])) > 0.03:
+                return
+            if m["laser"] and m["lcd"] <= 0 and d < 280:
+                m["charge"] += dt
+                if m["charge"] >= 0.75:
+                    if self.laser_hits(m, [me]) is me:
+                        self.damage(me, m, 315, "laser")
+                    m["charge"] = 0.0
+                    m["lcd"] = 1.65
+                return
+            if m["cd"] <= 0 and m["ammo"] > 0 and d < 230 and m["reload"] <= 0:
+                m["cd"] = 0.24
+                m["ammo"] -= 1
+                if m["ammo"] == 0:
+                    m["reload"] = 2.4
+                self.spawn_bullet(m, m["aim"][0], m["aim"][1], 45)
+            return
         on = abs(wrap(math.atan2(me["pos"][1] - m["pos"][1], me["pos"][0] - m["pos"][0]) - m["aim"][0])) < 0.05
         if not on:
             return
@@ -357,6 +442,82 @@ class Sim:
             p = m["acc"] * max(0.0, 1.0 - d / 260) * (1.0 - min(0.5, lateral / 40))
             if self.rng.random() < p and self.los(m, me, 7, 4.5):
                 self.damage(me, m, 45, "gun")
+
+    # ---- physical bullets ----------------------------------------------------------------
+    def spawn_bullet(self, owner, yaw, pitch, dmg, spread_deg=0.6, speed=252.0, rng=230.0):
+        yaw += self.rng.gauss(0, math.radians(spread_deg))
+        pitch += self.rng.gauss(0, math.radians(spread_deg))
+        cp = math.cos(pitch)
+        dx, dy, dz = cp * math.cos(yaw), cp * math.sin(yaw), math.sin(pitch)
+        p = owner["pos"]
+        self.bullets.append(dict(owner=owner, pos=[p[0] + 3 * dx, p[1] + 3 * dy, p[2] + 7 + 3 * dz],
+                                 vel=[speed * dx, speed * dy, speed * dz], ttl=rng / speed, dmg=dmg))
+
+    def bullets_step(self, dt):
+        keep = []
+        tg = None
+        for b in self.bullets:
+            ox, oy, oz = b["pos"]
+            vx, vy, vz = b["vel"]
+            nx, ny, nz = ox + vx * dt, oy + vy * dt, oz + vz * dt
+            b["ttl"] -= dt
+            owner = b["owner"]
+            if owner is self.me:
+                if tg is None:
+                    tg = self.targets()
+                cands = tg
+            else:
+                cands = [self.me] if self.me["alive"] else []
+            hit = None
+            best_s = 2.0
+            sx, sy = nx - ox, ny - oy
+            L2 = sx * sx + sy * sy or 1e-9
+            for m in cands:
+                mx, my, mz = m["pos"]
+                u = ((mx - ox) * sx + (my - oy) * sy) / L2
+                u = max(0.0, min(1.0, u))
+                cx, cy = ox + sx * u, oy + sy * u
+                r = m.get("radius", 2.5) * (1 + 0.05 * m.get("cubes", 0))
+                h = 9 if m.get("kind") == "mech" else (3.5 if m.get("kind") == "npc" else 1.6)
+                zc = oz + (nz - oz) * u
+                if (cx - mx) ** 2 + (cy - my) ** 2 < r * r and mz - 0.3 < zc < mz + h + 0.3 and u < best_s:
+                    best_s, hit = u, m
+            blocked = not self.M.los(ox, oy, oz, nx, ny, nz, 2.0)
+            if hit is not None and blocked:
+                hx, hy = ox + sx * best_s, oy + sy * best_s
+                if not self.M.los(ox, oy, oz, hx, hy, oz + (nz - oz) * best_s, 2.0):
+                    hit = None
+            if hit is not None:
+                if owner is self.me:
+                    self.hit_target(hit, b["dmg"], "gun")
+                else:
+                    self.damage(self.me, owner, b["dmg"], "gun")
+                continue
+            if blocked or b["ttl"] <= 0:
+                continue
+            b["pos"] = [nx, ny, nz]
+            keep.append(b)
+        self.bullets = keep
+
+    def laser_hits(self, shooter, victims):
+        """Hitscan along shooter's actual aim: first victim whose cylinder the ray passes, with LOS."""
+        yaw, pitch = shooter["aim"]
+        sx, sy, sz = shooter["pos"][0], shooter["pos"][1], shooter["pos"][2] + 7
+        dx, dy = math.cos(yaw), math.sin(yaw)
+        best = None
+        for m in victims:
+            ex, ey = m["pos"][0] - sx, m["pos"][1] - sy
+            along = ex * dx + ey * dy
+            if along <= 0 or along > 280:
+                continue
+            perp = abs(-ex * dy + ey * dx)
+            r = m.get("radius", 2.5) * (1 + 0.05 * m.get("cubes", 0))
+            h = 9 if m.get("kind") == "mech" else (3.5 if m.get("kind") == "npc" else 1.6)
+            zc = sz + math.tan(pitch) * along
+            if perp < r and m["pos"][2] - 0.5 < zc < m["pos"][2] + h + 0.5:
+                if (best is None or along < best[0]) and self.M.los(sx, sy, sz, sx + dx * along, sy + dy * along, zc):
+                    best = (along, m)
+        return best[1] if best else None
 
     # ---- NPCs ------------------------------------------------------------------------------
     def npc_step(self, n, dt):
@@ -441,7 +602,7 @@ class Sim:
         stats["boost_speed"] = 19.5 * me["speed_mult"]
         o = {"type": "obs", "tick": self.tick, "t": round(self.t, 2), "alive": sum(m["alive"] for m in self.mechs),
              "self": {"id": 0, "pos": list(me["pos"]), "vel": list(me["vel"]), "aim": list(me["aim"]), "hp": me["hp"], "max_hp": me["max_hp"],
-                      "energy": me["energy"], "max_energy": 100, "grounded": True, "cubes": me["cubes"],
+                      "energy": me["energy"], "max_energy": 100, "grounded": me.get("zoff", 0.0) <= 0.01, "cubes": me["cubes"],
                       "upgrades": [k for k, v in me["upg"].items() for _ in range(v)], "in_zone": in_zone,
                       "weapons": [{"kind": "gun", "cooldown": max(0.0, me["cd"], me.get("gequip", 0)), "ammo": me["ammo"],
                                    "reload": max(0.0, me["reload"]), "stats": g}, w1],
@@ -476,6 +637,7 @@ class Sim:
         mv = a.get("move", [0, 0])
         me["cmd"] = mv
         me["boost"] = a.get("boost", False)
+        me["jump_cmd"] = bool(a.get("jump", False))
         if "aim" in a:
             me["aim_cmd"] = a["aim"]
         fr = a.get("fire", [False, False])
@@ -556,7 +718,7 @@ class Sim:
         out += [dict(c, kind="crate", alive=True, _ref=c) for c in self.crates if c["hp"] > 0]
         return out
 
-    def ray_hit(self, yaw, pitch, rng, spread_deg=0.0, lead_noise=True):
+    def ray_hit(self, yaw, pitch, rng, spread_deg=0.0, lead_noise=True, jitter_s=0.0):
         me = self.me
         yaw += self.rng.gauss(0, math.radians(spread_deg)) if spread_deg else 0
         best = None
@@ -570,6 +732,11 @@ class Sim:
             f = self.rng.uniform(0.3, 1.0) if lead_noise else 0
             v = m.get("vel", [0, 0, 0])
             px, py = m["pos"][0] + v[0] * ft * f, m["pos"][1] + v[1] * ft * f
+            if jitter_s and m.get("kind") == "mech":
+                # it saw the charge coming / changed direction: lateral error up to jitter_s of travel
+                a = self.rng.uniform(-PI, PI)
+                j = self.rng.uniform(0, jitter_s) * 11.7
+                px, py = px + j * math.cos(a), py + j * math.sin(a)
             ex, ey = px - me["pos"][0], py - me["pos"][1]
             along = ex * math.cos(yaw) + ey * math.sin(yaw)
             perp = abs(-ex * math.sin(yaw) + ey * math.cos(yaw))
@@ -611,9 +778,15 @@ class Sim:
             me["ammo"] -= 1
             if me["ammo"] == 0:
                 me["reload"] = 2.4
-            m = self.ray_hit(me["aim"][0], me["aim"][1], 230, 0.6)
-            if m is not None:
-                self.hit_target(m, 45 * dm, "gun")
+            if self.phys:
+                self.spawn_bullet(me, me["aim"][0], me["aim"][1], 45 * dm)
+            else:
+                m = self.ray_hit(me["aim"][0], me["aim"][1], 230, 0.6)
+                if m is not None:
+                    self.hit_target(m, 45 * dm, "gun")
+            if self.intel == "vision" and any(o["alive"] and math.hypot(o["pos"][0] - me["pos"][0], o["pos"][1] - me["pos"][1]) < 320 for o in self.mechs[1:]):
+                self.last_seen_pos = (me["pos"][0] + self.rng.uniform(-20, 20), me["pos"][1] + self.rng.uniform(-20, 20))
+                self.last_seen_t = self.t
         w = me["w1"]
         if w is None or me["equip"] > 0:
             me["charge"] = 0.0
@@ -629,7 +802,10 @@ class Sim:
                     me["charge"] += dt
                     return
                 frac = 0.35 + 0.65 * me["charge"] / 0.75
-                m = self.ray_hit(me["aim"][0], me["aim"][1], 280, 0.0, lead_noise=False)
+                if self.phys:
+                    m = self.laser_hits(me, self.targets())
+                else:
+                    m = self.ray_hit(me["aim"][0], me["aim"][1], 280, 0.0, lead_noise=False, jitter_s=0.25 if self.tough else 0.0)
                 if m is not None:
                     self.hit_target(m, 315 * frac * dm, "laser")
                 me["charge"] = 0.0
@@ -764,6 +940,8 @@ class Sim:
             if me["alive"]:
                 self.our_fire(dt)
             self.shells_step(dt)
+            if self.phys:
+                self.bullets_step(dt)
             for m in self.mechs[1:]:
                 if m["alive"]:
                     self.squad_fire(m, dt)
@@ -826,6 +1004,10 @@ def main():
     seed0 = int(args[1]) if len(args) > 1 else 1
     mod = flags[flags.index("--bot") + 1] if "--bot" in flags else "bot"
     hunt = flags[flags.index("--hunt") + 1] if "--hunt" in flags else "normal"
+    intel = flags[flags.index("--intel") + 1] if "--intel" in flags else "omni"
+    tough = "--tough" in flags
+    if "--intel" in flags:
+        args = [a for a in args if a != intel]
     if "--bot" in flags:
         args = [a for a in args if a != mod]
     if "--hunt" in flags:
@@ -839,7 +1021,7 @@ def main():
         if not hasattr(M, "_walk0"):
             M._walk0 = bytes(M.walk)
         M.walk = bytearray(M._walk0)
-        sim = Sim(M, hello, bot_mod.Bot, seed0 + k, hunt)
+        sim = Sim(M, hello, bot_mod.Bot, seed0 + k, hunt, intel, tough)
         sim.trace = "--trace" in flags
         place = sim.run()
         scores.append(16 - place)

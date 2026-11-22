@@ -34,7 +34,7 @@ UPGRADE_PREF = [
 ]
 # PROFILE "fight": trade shots, farm cubes, take fights we can win (scored 4.00 on the practice board).
 # PROFILE "survive": stay unseen, shoot only when engaged or rushed, farm only early, fight only when clearly ahead.
-PROFILE = "survive"
+PROFILE = "fight"
 _P = {
     "fight":   dict(FIGHT_RATIO=0.9, FIRE_ALWAYS=True, CLOSE_FIRE=130.0, FARM_T_MAX=330.0, QUIET_S=0.0, CANOPY_W=3.0),
     "survive": dict(FIGHT_RATIO=1.4, FIRE_ALWAYS=False, CLOSE_FIRE=75.0, FARM_T_MAX=150.0, QUIET_S=20.0, CANOPY_W=6.0),
@@ -49,6 +49,14 @@ FAR_ESCAPE = True
 FARM_HP = 0.75
 RELOCATE = True
 DODGE_STRAFE = False
+STRAFE = True
+STRAFE_IDLE = 0.25
+JUMP_P_THREAT = 0.3
+JUMP_P_IDLE = 0.04
+LEAD_TAU = 1.0
+STICKY = 250.0
+FOCUS_W = 400.0
+PURSUE = True
 WEAPON_RANK = {"laser": 3, "lightning": 2, "mortar": 1}
 
 
@@ -123,6 +131,8 @@ class Bot:
         self.last_move = None
         self._zone_now = None
         self._cached_threats = []
+        self.strafe_side = 1.0
+        self.strafe_flip_t = 0.0
 
     # ------------------------------------------------------------------------------------
     @staticmethod
@@ -249,6 +259,10 @@ class Bot:
             if m.get("kind") == "mech" and m.get("id") != self.slot:
                 d = dict(m)
                 d["t"] = t
+                prev = self.memory.get(m["id"])
+                hist = prev.get("vh", []) if prev else []
+                hist = [h for h in hist if t - h[0] < 1.2] + [(t, m["vel"][0], m["vel"][1])]
+                d["vh"] = hist
                 self.memory[m["id"]] = d
         for k in [k for k, v in self.memory.items() if t - v["t"] > 25]:
             del self.memory[k]
@@ -493,6 +507,79 @@ class Bot:
 
     # ------------------------------------------------------------------------------------
     def _movement(self, obs, heavy_ok):
+        move, boost, jump = self._movement_core(obs, heavy_ok)
+        try:
+            return self._evasive(obs, move, boost, jump)
+        except Exception:
+            self._err("evasive")
+            return move, boost, jump
+
+    def _evasive(self, obs, move, boost, jump):
+        """Strafe across the line of fire with random reversals and hop at random, all the time.
+        Bullets fly 252 m/s (0.4-0.9 s at range): an enemy leading on our current velocity misses
+        when we reverse; hops shift the vertical aim point."""
+        t, x, y = self.t, self.x, self.y
+        s = self.s
+        if t < self.unstick_until or not STRAFE:
+            return move, boost, jump
+        grounded = bool(s.get("grounded", True))
+        kind = self.goal_kind
+        live = [m for m, w, lv in (self._cached_threats or []) if lv]
+        threatened = bool(live) or t - self.last_dmg_t < 3
+        # the direction shots come from
+        if live:
+            m = live[0]
+            ref = math.atan2(y - m["pos"][1], x - m["pos"][0])
+        elif t - self.last_dmg_t < 3 and self.last_dmg_bearing is not None:
+            ref = self.last_dmg_bearing + PI
+        elif move[0] or move[1]:
+            ref = math.atan2(move[1], move[0])
+        else:
+            ref = s["aim"][0]
+        if t > getattr(self, "strafe_flip_t", 0):
+            self.strafe_side = -getattr(self, "strafe_side", 1.0) if self.rng.random() < 0.8 else getattr(self, "strafe_side", 1.0)
+            self.strafe_flip_t = t + self.rng.uniform(0.3, 0.85)
+        side = self.strafe_side
+        px, py = -math.sin(ref) * side, math.cos(ref) * side
+        M = self.map
+        if M is not None and not M.walkable(x + px * 5, y + py * 5):
+            self.strafe_side = -side
+            px, py = -px, -py
+        mx, my = move
+        mag = math.hypot(mx, my)
+        if kind in ("zone!",):
+            amp = 0.35
+        elif kind in ("mortar!", "dodge"):
+            amp = 0.3
+        elif threatened:
+            amp = 1.0
+        elif kind in ("pickup", "drop", "cube"):
+            amp = 0.4
+        else:
+            amp = STRAFE_IDLE
+        if mag < 0.05:
+            # holding a spot: weave around it, pulled back to the anchor
+            ax, ay = getattr(self, "anchor", None) or (x, y)
+            if self.goal is not None:
+                ax, ay = self.goal
+            self.anchor = (ax, ay)
+            bx, by = (ax - x) * 0.25, (ay - y) * 0.25
+            nx, ny = px * amp + bx, py * amp + by
+        else:
+            nx, ny = mx + px * amp, my + py * amp
+        n = math.hypot(nx, ny)
+        if n > 1:
+            nx, ny = nx / n, ny / n
+        # random hops (free: no energy); never while racing the zone on boost
+        if grounded and not boost and kind != "zone!":
+            p = JUMP_P_THREAT if threatened else JUMP_P_IDLE
+            if self.rng.random() < p:
+                jump = True
+        if not grounded and kind != "zone!":
+            boost = False  # boost in the air is a jet: don't burn energy by accident
+        return (nx, ny), boost, jump
+
+    def _movement_core(self, obs, heavy_ok):
         t, x, y = self.t, self.x, self.y
         s = self.s
         energy = s.get("energy", 0)
@@ -636,6 +723,13 @@ class Bot:
     def _fight_target(self, live, hp_frac):
         """Pick a lone enemy we can beat, or None (then we evade)."""
         x, y = self.x, self.y
+        # a badly hurt enemy nearby is worth chasing down: every kill is a place
+        if PURSUE and hp_frac > 0.4:
+            weak = [m for m, w in live if (m.get("hp") or 9999) < 0.35 * (m.get("max_hp") or 1400)
+                    and math.hypot(m["pos"][0] - x, m["pos"][1] - y) < 200]
+            others = [m for m, w in live if math.hypot(m["pos"][0] - x, m["pos"][1] - y) < 150]
+            if weak and len(others) <= 2:
+                return min(weak, key=lambda m: m.get("hp") or 9999)
         near = [(m, w) for m, w in live if math.hypot(m["pos"][0] - x, m["pos"][1] - y) < 170]
         if not near:
             return None
@@ -866,6 +960,10 @@ class Bot:
                 self.astar = nav.AStar(M, sk, gk, self._zone_now)
                 self.astar_goal = (gx, gy)
             if self.astar.step(4000, 0.008 if heavy_ok else 0.003):
+                if not self.astar.path and M.reset_marks():
+                    # our learned blocks cut every route: forget them and search again next tick
+                    self.astar = None
+                    return ((gx - x) / d, (gy - y) / d)
                 self.path = (self.astar.path + [(gx, gy)]) if self.astar.path else None
                 self.path_i = 0
                 self.path_goal = (gx, gy)
@@ -927,9 +1025,11 @@ class Bot:
                     sc += 150
                 if ft is not None and ft.get("id") == m["id"]:
                     sc += 200
+                if m["id"] == self.target_id:
+                    sc += STICKY  # finish what we started: spread damage just regenerates
                 hp = m.get("hp")
                 if hp is not None:
-                    sc += max(0, 700 - hp) * 0.3
+                    sc += (1 - hp / max(1.0, m.get("max_hp") or 1400)) * FOCUS_W
                 aiming_at_us = abs(wrap(math.atan2(y - my, x - mx) - m["aim"][0])) < 0.35
                 if abs(wrap(math.atan2(y - my, x - mx) - m["aim"][0])) > PI / 2:
                     sc += 60  # its back is to us: x1.5 damage
@@ -970,18 +1070,16 @@ class Bot:
             mx, my, mz = m["pos"]
             vx, vy, vz = m.get("vel", [0, 0, 0])
             is_mech = m.get("kind") == "mech"
-            # gun lead
-            tx, ty, tz = mx, my, cz
-            for _ in range(2):
-                tt = math.hypot(tx - x, ty - y) / gspeed
-                tx, ty = mx + vx * tt, my + vy * tt
-                tz = cz + (vz * tt if is_mech else 0)
+            tx, ty, tz = self._predict(m, cz, 0.0)
+            for _ in range(3):
+                tt = math.hypot(tx - x, ty - y) / gspeed + 0.05
+                tx, ty, tz = self._predict(m, cz, tt)
             gyaw = math.atan2(ty - y, tx - x)
             gpitch = math.atan2(tz - muzzle, math.hypot(tx - x, ty - y))
-            # hitscan aim (laser / lightning): one decision ahead
-            hx, hy = mx + vx * 0.1, my + vy * 0.1
+            # hitscan aim (laser / lightning): the beam leaves after this decision is applied
+            hx, hy, hz = self._predict(m, cz, 0.08)
             hyaw = math.atan2(hy - y, hx - x)
-            hpitch = math.atan2(cz - muzzle, max(1.0, math.hypot(hx - x, hy - y)))
+            hpitch = math.atan2(hz - muzzle, max(1.0, math.hypot(hx - x, hy - y)))
             aim = (gyaw, gpitch)
             cur = s.get("aim", [gyaw, gpitch])
             tol = max(0.012, math.atan2(2.0 if is_mech else 1.2, max(d, 1.0)))
@@ -1024,6 +1122,36 @@ class Bot:
             if ammo <= 0 or (best is None and ammo < gstats.get("mag", 12) * 0.5 and t - self.last_dmg_t > 2):
                 reload_ = True
         return aim, fire0, fire1, reload_
+
+    def _predict(self, m, cz, tt):
+        """Where m's aim point will be in tt seconds.
+        Horizontal: average drift plus the current strafe component, decayed for random reversals
+        (a strafer that flips every ~LEAD_TAU s is expected to come back toward its mean).
+        Vertical: ballistic if airborne, never below the ground."""
+        mx, my, mz = m["pos"]
+        vx, vy, vz = m.get("vel", [0, 0, 0])
+        if tt <= 0:
+            return mx, my, cz
+        ax, ay = vx, vy
+        mem = self.memory.get(m.get("id")) if m.get("kind") == "mech" else None
+        vh = mem.get("vh") if mem else None
+        if vh and len(vh) >= 4:
+            ax = sum(h[1] for h in vh) / len(vh)
+            ay = sum(h[2] for h in vh) / len(vh)
+        ox, oy = vx - ax, vy - ay
+        k = (LEAD_TAU / 2.0) * (1 - math.exp(-2.0 * tt / LEAD_TAU))
+        px = mx + ax * tt + ox * k
+        py = my + ay * tt + oy * k
+        dz = 0.0
+        M = self.map
+        g = self.mortar_g
+        if m.get("kind") == "mech" and (abs(vz) > 0.3 or (M is not None and mz > M.ground(mx, my) + 0.6)):
+            gr = M.ground(px, py) if M is not None else mz
+            znew = max(gr, mz + vz * tt - 0.5 * g * tt * tt)
+            if M is not None and mz > M.ground(mx, my) + 3.0 and abs(vz) < 0.3:
+                znew = mz  # standing on a roof / bridge
+            dz = znew - mz
+        return px, py, cz + dz
 
     @staticmethod
     def _gun_bad(gun):
