@@ -32,12 +32,23 @@ UPGRADE_PREF = [
     "lightning_efficiency", "lightning_range", "gun_mag", "capacitor", "reactor", "jets", "sensors",
     "mortar_reload", "mortar_splash", "gyros", "gun_velocity", "lightning_chain", "mortar_velocity", "laser_pierce",
 ]
-FIGHT_RATIO = 0.9
+# PROFILE "fight": trade shots, farm cubes, take fights we can win (scored 4.00 on the practice board).
+# PROFILE "survive": stay unseen, shoot only when engaged or rushed, farm only early, fight only when clearly ahead.
+PROFILE = "survive"
+_P = {
+    "fight":   dict(FIGHT_RATIO=0.9, FIRE_ALWAYS=True, CLOSE_FIRE=130.0, FARM_T_MAX=330.0, QUIET_S=0.0, CANOPY_W=3.0),
+    "survive": dict(FIGHT_RATIO=1.4, FIRE_ALWAYS=False, CLOSE_FIRE=75.0, FARM_T_MAX=150.0, QUIET_S=20.0, CANOPY_W=6.0),
+}[PROFILE]
+FIGHT_RATIO = _P["FIGHT_RATIO"]
+FIRE_ALWAYS = _P["FIRE_ALWAYS"]
+CLOSE_FIRE = _P["CLOSE_FIRE"]      # always shoot back at mechs closer than this
+FARM_T_MAX = _P["FARM_T_MAX"]      # no crate / NPC farming after this match time
+QUIET_S = _P["QUIET_S"]            # farm only if no enemy mech was seen for this long
+CANOPY_W = _P["CANOPY_W"]
 FAR_ESCAPE = True
-FIRE_ALWAYS = True
-CANOPY_W = 3.0
 FARM_HP = 0.75
 RELOCATE = True
+DODGE_STRAFE = False
 WEAPON_RANK = {"laser": 3, "lightning": 2, "mortar": 1}
 
 
@@ -265,6 +276,10 @@ class Bot:
     def _update_items(self, obs):
         t, x, y = self.t, self.x, self.y
         seen = set()
+        for m in obs.get("mechs", []):
+            if m.get("kind") == "npc":
+                self.items[m["id"]] = {"cat": "npcs", "pos": m["pos"], "t": t, "hp": m.get("hp", 350)}
+                seen.add(m["id"])
         for kind in ("cubes", "pickups", "crates"):
             for it in obs.get(kind, []) or []:
                 d = {"cat": kind, "pos": it["pos"], "t": t}
@@ -274,10 +289,21 @@ class Bot:
                     d["hp"] = it.get("hp", 300)
                 self.items[it["id"]] = d
                 seen.add(it["id"])
-        # forget items that should be visible right here but are not (taken or destroyed)
+        # forget items that should be visible right here but are not (taken or destroyed);
+        # NPCs wander, so their memory is short
         for k in [k for k, v in self.items.items()
-                  if k not in seen and (math.hypot(v["pos"][0] - x, v["pos"][1] - y) < 25 or t - v["t"] > 90)]:
+                  if k not in seen and (math.hypot(v["pos"][0] - x, v["pos"][1] - y) < 25 or t - v["t"] > 90
+                                        or (v["cat"] == "npcs" and t - v["t"] > 20))]:
             del self.items[k]
+
+    def _farm_ok(self, hp_frac):
+        """Shooting crates / drones is loud and pauses regen: only when healthy, early, and unseen."""
+        if hp_frac <= FARM_HP or self.t > FARM_T_MAX:
+            return False
+        if QUIET_S > 0 and self.memory:
+            if self.t - max(v["t"] for v in self.memory.values()) < QUIET_S:
+                return False
+        return True
 
     def _pick_upgrade(self, offer):
         ch = offer.get("choices", [])
@@ -532,6 +558,8 @@ class Bot:
                     n = math.hypot(dx, dy) or 1.0
                     dodge = (dx / n, dy / n)
                     break
+                if not DODGE_STRAFE:
+                    continue
                 if t > self.dodge_switch_t:
                     self.dodge_side = self.rng.choice((-1.0, 1.0))
                     self.dodge_switch_t = t + self.rng.uniform(0.3, 0.7)
@@ -700,17 +728,25 @@ class Bot:
                 continue
             if sc > bscore:
                 bscore, best = sc, (it["cat"][:-1], (px, py))
-        # crates/NPCs are shot from where we stand (see _combat); walk toward a crate only if out of range
-        if best is None and t < 300 and hp_frac > 0.6:
+        # crates / NPC drones are shot from where we stand (see _combat): walk until we have a clear shot
+        if best is None and self._farm_ok(hp_frac):
+            muzzle = self.z + self.s.get("stats", {}).get("muzzle_height", 7.0)
             for k, it in self.items.items():
-                if it["cat"] != "crates":
+                cat = it["cat"]
+                if cat not in ("crates", "npcs"):
                     continue
                 px, py, pz = it["pos"]
                 dist = math.hypot(px - x, py - y)
-                if 60 < dist < 150 and not risky(px, py) and self._spot_zone_ok(obs, px, py, 5):
-                    sc = -dist
-                    if sc > bscore:
-                        bscore, best = sc, ("crate", (px, py))
+                if dist > 170 or abs(pz - self.z) > 6:
+                    continue
+                if risky(px, py) or not self._spot_zone_ok(obs, px, py, 5):
+                    continue
+                clear = dist < (95 if cat == "npcs" else 110) and (
+                    M is None or M.los(x, y, muzzle, px, py, pz + (1.75 if cat == "npcs" else 0.8)))
+                sc = -dist + (25 if cat == "npcs" else 0)
+                if sc > bscore:
+                    bscore = sc
+                    best = (cat[:-1], (x, y) if clear else (px, py))
         return best
 
     # ------------------------------------------------------------------------------------
@@ -897,15 +933,15 @@ class Bot:
                 aiming_at_us = abs(wrap(math.atan2(y - my, x - mx) - m["aim"][0])) < 0.35
                 if abs(wrap(math.atan2(y - my, x - mx) - m["aim"][0])) > PI / 2:
                     sc += 60  # its back is to us: x1.5 damage
-                if not (FIRE_ALWAYS or engaged or d < 130 or aiming_at_us or (hp or 9999) < 450 or ft is not None):
+                if not (FIRE_ALWAYS or engaged or d < CLOSE_FIRE or (aiming_at_us and d < 160) or (hp or 9999) < 450 or ft is not None):
                     continue
             else:
                 attacking = m["id"] in self.attackers and t - self.attackers[m["id"]] < 5
-                if not (attacking or (alone and hp_frac > FARM_HP and d < 130)):
+                if not (attacking or (alone and self._farm_ok(hp_frac) and d < 130)):
                     continue
             if sc > bscore:
                 bscore, best = sc, (m, cz, d, "actor")
-        if best is None and alone and hp_frac > FARM_HP and t - self.last_dmg_t > 5:
+        if best is None and alone and self._farm_ok(hp_frac) and t - self.last_dmg_t > 5:
             # crates: 1 cube each, half drop a weapon
             for c in obs.get("crates", []):
                 cx_, cy_, cz_ = c["pos"]
@@ -958,7 +994,8 @@ class Bot:
                 ready = fin(w1.get("cooldown", 0)) <= 0
                 if ready and d < ls.get("range", 280) * 0.95:
                     if ch < full - 0.06:
-                        fire1 = True
+                        # charging halves our speed: never start one while racing the zone
+                        fire1 = ch > 0 or self.goal_kind != "zone!"
                     else:
                         aim = (hyaw, hpitch)
                         on = abs(wrap(cur[0] - hyaw)) < tol and abs(cur[1] - hpitch) < tol * 1.5 + 0.01
