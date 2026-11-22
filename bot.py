@@ -53,10 +53,15 @@ STRAFE = True
 STRAFE_IDLE = 0.25
 JUMP_P_THREAT = 0.3
 JUMP_P_IDLE = 0.04
-LEAD_TAU = 1.0
+LEAD_TAU = 2.0
+GUN_MAX_MECH = 160.0
+HOSTILE_ONLY = True
 STICKY = 250.0
 FOCUS_W = 400.0
 PURSUE = True
+STRAFE_ANG = 0.6
+STOP_P = 0.15
+STRAFE_BOOST = True
 WEAPON_RANK = {"laser": 3, "lightning": 2, "mortar": 1}
 
 
@@ -131,8 +136,13 @@ class Bot:
         self.last_move = None
         self._zone_now = None
         self._cached_threats = []
+        self.hostile = {}         # mech id -> last time it acted hostile toward us
+        self.aim_seen = {}        # mech id -> consecutive decisions with its torso deliberately on us
         self.strafe_side = 1.0
         self.strafe_flip_t = 0.0
+        self.strafe_ang = 0.0
+        self.strafe_stop = False
+        self.boosting = True
 
     # ------------------------------------------------------------------------------------
     @staticmethod
@@ -261,11 +271,30 @@ class Bot:
                 d["t"] = t
                 prev = self.memory.get(m["id"])
                 hist = prev.get("vh", []) if prev else []
-                hist = [h for h in hist if t - h[0] < 1.2] + [(t, m["vel"][0], m["vel"][1])]
+                hist = [h for h in hist if t - h[0] < 2.0] + [(t, m["vel"][0], m["vel"][1])]
                 d["vh"] = hist
                 self.memory[m["id"]] = d
         for k in [k for k, v in self.memory.items() if t - v["t"] > 25]:
             del self.memory[k]
+        # hostile = hunting us: aims at us while closing in / close, or very close
+        x, y = self.x, self.y
+        for m in obs.get("mechs", []):
+            if m.get("kind") != "mech":
+                continue
+            mx, my = m["pos"][0], m["pos"][1]
+            d = math.hypot(mx - x, my - y)
+            to_us = math.atan2(y - my, x - mx)
+            aiming = abs(wrap(to_us - m["aim"][0])) < 0.2
+            spd = math.hypot(m["vel"][0], m["vel"][1])
+            heading = math.atan2(m["vel"][1], m["vel"][0])
+            # walking toward us looks like aiming at us: only count a torso turned at us off its path
+            deliberate = aiming and (spd < 3.0 or abs(wrap(heading - m["aim"][0])) > 0.5)
+            if deliberate and d < 220:
+                self.aim_seen[m["id"]] = self.aim_seen.get(m["id"], 0) + 1
+            else:
+                self.aim_seen[m["id"]] = 0
+            if d < 30 or self.aim_seen[m["id"]] >= 4 or (m.get("charging") and aiming):
+                self.hostile[m["id"]] = t
         for e in obs.get("events", []):
             ty = e.get("type")
             if ty == "damaged":
@@ -274,6 +303,7 @@ class Bot:
                     self.last_dmg_bearing = e.get("bearing")
                     if e.get("by") is not None:
                         self.attackers[e["by"]] = t
+                        self.hostile[e["by"]] = t
                 self.dmg_window.append((t, e.get("amount", 0)))
             elif ty == "hit":
                 self.last_hit_t = t
@@ -536,11 +566,17 @@ class Bot:
             ref = math.atan2(move[1], move[0])
         else:
             ref = s["aim"][0]
-        if t > getattr(self, "strafe_flip_t", 0):
-            self.strafe_side = -getattr(self, "strafe_side", 1.0) if self.rng.random() < 0.8 else getattr(self, "strafe_side", 1.0)
-            self.strafe_flip_t = t + self.rng.uniform(0.3, 0.85)
+        if t > self.strafe_flip_t:
+            # new leg of the weave: flip side (usually), random angle off the perpendicular,
+            # random length, sometimes a short dead stop: no rhythm for a leading aimbot to learn
+            if self.rng.random() < 0.8:
+                self.strafe_side = -self.strafe_side
+            self.strafe_ang = self.rng.uniform(-STRAFE_ANG, STRAFE_ANG)
+            self.strafe_stop = self.rng.random() < STOP_P
+            self.strafe_flip_t = t + (self.rng.uniform(0.12, 0.25) if self.strafe_stop else self.rng.uniform(0.25, 0.8))
         side = self.strafe_side
-        px, py = -math.sin(ref) * side, math.cos(ref) * side
+        a = ref + side * (PI / 2 + getattr(self, "strafe_ang", 0.0))
+        px, py = math.cos(a), math.sin(a)
         M = self.map
         if M is not None and not M.walkable(x + px * 5, y + py * 5):
             self.strafe_side = -side
@@ -552,7 +588,7 @@ class Bot:
         elif kind in ("mortar!", "dodge"):
             amp = 0.3
         elif threatened:
-            amp = 1.0
+            amp = 0.0 if getattr(self, "strafe_stop", False) else 1.0
         elif kind in ("pickup", "drop", "cube"):
             amp = 0.4
         else:
@@ -570,8 +606,23 @@ class Bot:
         n = math.hypot(nx, ny)
         if n > 1:
             nx, ny = nx / n, ny / n
+        # strafe at full speed: boost on the ground while under fire, with an energy reserve
+        # (lightning shots and wall climbs need energy too)
+        burst = t - self.last_dmg_t < 1.5 or any(
+            m.get("charging") and abs(wrap(math.atan2(y - m["pos"][1], x - m["pos"][0]) - m["aim"][0])) < 0.2 for m in live)
+        if burst and STRAFE_BOOST and grounded and kind not in ("zone!",):
+            w1 = self._w1()
+            reserve = 55.0 if (w1 and w1.get("kind") == "lightning") else 50.0
+            charging = w1 is not None and w1.get("kind") == "laser" and fin(w1.get("charge", 0)) > 0
+            e = s.get("energy", 0)
+            if self.boosting and e < reserve:
+                self.boosting = False
+            elif not self.boosting and e > reserve + 30:
+                self.boosting = True
+            if self.boosting and not charging and (nx or ny):
+                boost = True
         # random hops (free: no energy); never while racing the zone on boost
-        if grounded and not boost and kind != "zone!":
+        if grounded and kind != "zone!" and not (boost and kind == "zone!"):
             p = JUMP_P_THREAT if threatened else JUMP_P_IDLE
             if self.rng.random() < p:
                 jump = True
@@ -720,9 +771,20 @@ class Bot:
                 return best
         return None
 
+    def _is_hostile(self, m):
+        if not HOSTILE_ONLY:
+            return True
+        if self.t - self.hostile.get(m.get("id"), -99) < 6.0:
+            return True
+        hp, mx = m.get("hp"), m.get("max_hp") or 1400
+        return hp is not None and hp < 0.2 * mx  # nearly dead: an easy place
+
     def _fight_target(self, live, hp_frac):
         """Pick a lone enemy we can beat, or None (then we evade)."""
         x, y = self.x, self.y
+        live = [(m, w) for m, w in live if self._is_hostile(m)]
+        if not live:
+            return None
         # a badly hurt enemy nearby is worth chasing down: every kill is a place
         if PURSUE and hp_frac > 0.4:
             weak = [m for m, w in live if (m.get("hp") or 9999) < 0.35 * (m.get("max_hp") or 1400)
@@ -1030,6 +1092,8 @@ class Bot:
                 hp = m.get("hp")
                 if hp is not None:
                     sc += (1 - hp / max(1.0, m.get("max_hp") or 1400)) * FOCUS_W
+                if not self._is_hostile(m):
+                    continue  # leave passive squad members alone: shooting them starts fights we don't need
                 aiming_at_us = abs(wrap(math.atan2(y - my, x - mx) - m["aim"][0])) < 0.35
                 if abs(wrap(math.atan2(y - my, x - mx) - m["aim"][0])) > PI / 2:
                     sc += 60  # its back is to us: x1.5 damage
@@ -1070,16 +1134,19 @@ class Bot:
             mx, my, mz = m["pos"]
             vx, vy, vz = m.get("vel", [0, 0, 0])
             is_mech = m.get("kind") == "mech"
+            svx, svy, svz = s.get("vel", [0, 0, 0])
+            ox, oy = x + svx * 0.08, y + svy * 0.08   # where we'll be when the shot leaves
+            om = muzzle + svz * 0.08
             tx, ty, tz = self._predict(m, cz, 0.0)
             for _ in range(3):
-                tt = math.hypot(tx - x, ty - y) / gspeed + 0.05
+                tt = math.hypot(tx - ox, ty - oy) / gspeed + 0.08
                 tx, ty, tz = self._predict(m, cz, tt)
-            gyaw = math.atan2(ty - y, tx - x)
-            gpitch = math.atan2(tz - muzzle, math.hypot(tx - x, ty - y))
+            gyaw = math.atan2(ty - oy, tx - ox)
+            gpitch = math.atan2(tz - om, math.hypot(tx - ox, ty - oy))
             # hitscan aim (laser / lightning): the beam leaves after this decision is applied
             hx, hy, hz = self._predict(m, cz, 0.08)
-            hyaw = math.atan2(hy - y, hx - x)
-            hpitch = math.atan2(hz - muzzle, max(1.0, math.hypot(hx - x, hy - y)))
+            hyaw = math.atan2(hy - oy, hx - ox)
+            hpitch = math.atan2(hz - om, max(1.0, math.hypot(hx - ox, hy - oy)))
             aim = (gyaw, gpitch)
             cur = s.get("aim", [gyaw, gpitch])
             tol = max(0.012, math.atan2(2.0 if is_mech else 1.2, max(d, 1.0)))
@@ -1113,7 +1180,8 @@ class Bot:
                         fire1 = True
 
             # ---- gun ------------------------------------------------------------------
-            if gun is not None and gun.get("reload", 0) <= 0 and gun.get("ammo", 1) > 0 and d < grange * 0.95:
+            far_ok = not is_mech or d < GUN_MAX_MECH or math.hypot(vx, vy) < 4.0
+            if gun is not None and gun.get("reload", 0) <= 0 and gun.get("ammo", 1) > 0 and d < grange * 0.95 and far_ok:
                 if abs(wrap(cur[0] - gyaw)) < tol and abs(cur[1] - gpitch) < tol * 1.5 + 0.01:
                     fire0 = True
                     # don't waste a laser release window on gun alignment: both share the torso
