@@ -38,7 +38,9 @@ def load_hello():
 
 
 PHYS = "--nophys" not in sys.argv
-UPG = ["plating", "armor", "servos", "nanites", "sensors", "gyros", "capacitor", "reactor", "gun_damage", "gun_rate"]
+PASSIVE = "--passive" in sys.argv
+UPG = ["plating", "armor", "servos", "nanites", "sensors", "gyros", "capacitor", "reactor", "gun_damage", "gun_rate",
+       "gun_mag", "laser_damage", "laser_charge"]
 
 
 class Sim:
@@ -227,6 +229,7 @@ class Sim:
         if victim is self.me:
             self.events.append({"type": "damaged", "amount": amount, "weapon": weapon, "bearing": bearing, "by": attacker["id"], "rear": rear})
         if attacker is self.me:
+            victim["hit_by_us_t"] = self.t
             self.events.append({"type": "hit", "target": victim["id"], "amount": amount, "weapon": weapon})
 
     def dmg_mult(self, m):
@@ -378,7 +381,12 @@ class Sim:
             err = math.radians({"easy": 1.6, "medium": 1.1, "hard": 0.7, "expert": 0.45}[m["tier"]])
             m["aim_cmd"] = [math.atan2(py - m["pos"][1], px - m["pos"][0]) + self.rng.gauss(0, err),
                             math.atan2(me["pos"][2] + 4.5 - m["pos"][2] - 7, max(1.0, d))]
-            m["fire"] = cansee and (m["hunter"] or d < 110) and not m.get("retreat")
+            provoked = self.t - m.get("hit_by_us_t", -99) < 10
+            near = d < (50 if PASSIVE else 110)
+            m["fire"] = cansee and (m["hunter"] or near or provoked) and not m.get("retreat")
+            if PASSIVE and not (m["hunter"] or near or provoked):
+                # a passive member looks where it walks, not at us
+                m["aim_cmd"] = [math.atan2(m["cmd"][1], m["cmd"][0]) if (m["cmd"][0] or m["cmd"][1]) else m["aim"][0], 0]
             if self.tough and m["fire"]:
                 if self.t > m.get("strafe_t", 0):
                     m["strafe"] = self.rng.choice((-1.0, 1.0))
@@ -590,10 +598,14 @@ class Sim:
                               "hp": n["hp"], "max_hp": 350})
         in_zone = math.hypot(me["pos"][0] - z["center"][0], me["pos"][1] - z["center"][1]) <= z["radius"]
         g = dict(self.cfg["weapons"]["gun"])
-        g["damage"] = 45
+        g["damage"] = 45 * me.get("gun_dmg", 1.0)
+        g["cooldown"] = me.get("gun_cd", 0.24)
+        g["mag"] = me.get("mag", 12)
         w1 = None
         if me["w1"]:
             ws = dict(self.cfg["weapons"][me["w1"]])
+            if me["w1"] == "laser":
+                ws["charge"] = me.get("laser_full", 0.75)
             w1 = {"kind": me["w1"], "cooldown": max(0.0, me["w1cd"], me["equip"]), "stats": ws}
             if me["w1"] == "laser":
                 w1["charge"] = me["charge"]
@@ -666,6 +678,16 @@ class Sim:
             me["armor"] += 0.08
         elif uid == "servos":
             me["speed_mult"] *= 1.08
+        elif uid == "gun_damage":
+            me["gun_dmg"] = me.get("gun_dmg", 1.0) * 1.15
+        elif uid == "gun_rate":
+            me["gun_cd"] = me.get("gun_cd", 0.24) * 0.87
+        elif uid == "gun_mag":
+            me["mag"] = me.get("mag", 12) + 8
+        elif uid == "laser_damage":
+            me["laser_dmg"] = me.get("laser_dmg", 1.0) * 1.18
+        elif uid == "laser_charge":
+            me["laser_full"] = me.get("laser_full", 0.75) * 0.75
         elif uid == "nanites":
             me["regen"] *= 1.6
             me["regen_delay"] -= 1.5
@@ -772,14 +794,14 @@ class Sim:
         if me["reload"] > 0:
             me["reload"] -= dt
             if me["reload"] <= 0:
-                me["ammo"] = 12
+                me["ammo"] = me.get("mag", 12)
         elif me["fire"] and me["cd"] <= 0 and me["ammo"] > 0:
-            me["cd"] = 0.24
+            me["cd"] = me.get("gun_cd", 0.24)
             me["ammo"] -= 1
             if me["ammo"] == 0:
                 me["reload"] = 2.4
             if self.phys:
-                self.spawn_bullet(me, me["aim"][0], me["aim"][1], 45 * dm)
+                self.spawn_bullet(me, me["aim"][0], me["aim"][1], 45 * dm * me.get("gun_dmg", 1.0))
             else:
                 m = self.ray_hit(me["aim"][0], me["aim"][1], 230, 0.6)
                 if m is not None:
@@ -792,22 +814,23 @@ class Sim:
             me["charge"] = 0.0
             return
         if w == "laser":
+            full = me.get("laser_full", 0.75)
             if me["fire1"] and me["w1cd"] <= 0:
-                me["charge"] = min(0.75, me["charge"] + dt)
-                me["hold"] = me.get("hold", 0) + (dt if me["charge"] >= 0.75 else 0)
+                me["charge"] = min(full, me["charge"] + dt)
+                me["hold"] = me.get("hold", 0) + (dt if me["charge"] >= full else 0)
                 if me["hold"] < 2.0:
                     return
             if me["charge"] > 0 and me["w1cd"] <= 0:
                 if me["charge"] < 0.15:
                     me["charge"] += dt
                     return
-                frac = 0.35 + 0.65 * me["charge"] / 0.75
+                frac = 0.35 + 0.65 * me["charge"] / full
                 if self.phys:
                     m = self.laser_hits(me, self.targets())
                 else:
                     m = self.ray_hit(me["aim"][0], me["aim"][1], 280, 0.0, lead_noise=False, jitter_s=0.25 if self.tough else 0.0)
                 if m is not None:
-                    self.hit_target(m, 315 * frac * dm, "laser")
+                    self.hit_target(m, 315 * frac * dm * me.get("laser_dmg", 1.0), "laser")
                 me["charge"] = 0.0
                 me["hold"] = 0.0
                 me["w1cd"] = 1.65
@@ -906,11 +929,21 @@ class Sim:
     def run(self):
         dt = 0.05
         hunt_plan = {"normal": [(20, 1), (150, 4), (270, 15)], "fast": [(10, 2), (90, 6), (180, 15)],
-                     "slow": [(40, 1), (200, 3), (320, 15)]}[self.hunt]
+                     "slow": [(40, 1), (200, 3), (320, 15)], "squad": []}[self.hunt]
         order = list(range(1, 16))
         self.rng.shuffle(order)
+        if self.hunt == "squad":
+            # official rule: weakest first; one early, more as we thin them out, all of them late
+            rank = {"easy": 0, "medium": 1, "hard": 2, "expert": 3}
+            order.sort(key=lambda i: rank[self.mechs[i]["tier"]])
         me = self.me
         while self.t < 480:
+            if self.hunt == "squad":
+                if self.t >= 15:
+                    alive = [i for i in order if self.mechs[i]["alive"]]
+                    n = len(alive) if self.t >= 300 else 1 + self.kills
+                    for i in alive[:n]:
+                        self.mechs[i]["hunter"] = True
             for (ht, n) in hunt_plan:
                 if self.t >= ht:
                     for i in order[:n]:

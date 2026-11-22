@@ -8,7 +8,7 @@ mod = pos[0]
 n = int(pos[1]) if len(pos) > 1 else 24
 jobs = int(pos[2]) if len(pos) > 2 else 2
 intel = pos[3] if len(pos) > 3 else "omni"
-hunts = ("normal", "fast")
+hunts = ("normal",) if "--normal" in extra else (("squad",) if "--squad" in extra else ("normal", "fast"))
 procs = []
 for h in hunts:
     for j in range(jobs):
